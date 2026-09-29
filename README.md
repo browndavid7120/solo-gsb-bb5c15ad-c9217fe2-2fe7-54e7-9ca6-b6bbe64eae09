@@ -194,6 +194,16 @@ curl -X POST http://localhost:8000/consumers/worker-1/pull \
 - **租约过期后**:同一批次可被重新投递(沿用原区间,换发**新 token**);旧 token 立即作废。
 - **空队列**:返回 `{"events":[],"lease_token":null,"lease_expires_at":null}`,**不创建租约**;之后新事件到达可继续拉取。
 - 首次出现的 `consumer_id` 自动建档,游标为 0,即首批从 `seq=1` 开始。
+- **序号缺口防护**(首次拉取、未过期租约重拉、过期续租三条路径一致):返回批次前都会核对**拟返回批次从起点到末尾的序号连续性**。事件表中间记录意外缺失(`/integrity` 报 `seq_gap`)时,`LIMIT` 也不会把缺口两侧事件合为一批——直接返回 **409**,响应 `first_break` 与 `/integrity` 完全同构(`seq`/`event_id`/`reason`,缺失延续到批次末尾时 `event_id` 为 `null`),并附 `cursor_seq`/`anchor_seq` 与批次/租约区间;**游标与租约保持原状**(首次不建租约、不发放 token;期内不续租不换 token;过期不换发新 token)。记录以原 `seq` 恢复后,同一请求即恢复原约定:首次正常建租,期内重拉沿用原 token 与过期时间,过期续租按本次 `lease_seconds` 换发新 token。归档锚点仍是可投递起点:压缩归档后才建档的 consumer 从 `anchor_seq + 1` 开始,缺口前的干净边界批次仍可正常租用。
+
+```json
+{"detail": "pull batch is not seq-continuous",
+ "first_break": {"seq": 3, "event_id": "evt-3", "reason": "seq_gap"},
+ "cursor_seq": 0, "anchor_seq": 0,
+ "batch_from_seq": 1, "batch_to_seq": 5}
+```
+
+可运行的端到端示例见 `examples/consume_seq_gap_check.sh`(含首次缺口、期内重拉缺口、过期续租缺口、修复恢复全流程)。
 
 ### 6. 消费游标:确认批次
 
@@ -214,6 +224,8 @@ curl -X POST http://localhost:8000/consumers/worker-1/ack \
 - token 与当前租约不一致(**伪造**或**旧 token**——旧批次过期后已被新租约取代);
 - 租约**已过期**(过期批次可重投,旧 token 不得再确认);
 - 当前没有租约(从未拉取、已确认完毕、或上次拉取是空批次),包括未知 consumer。
+
+此外,确认推进前还会核对**当前租约区间 `[lease_from_seq, lease_to_seq]` 的序号连续性**:租约建立后区间内记录若意外缺失、缺口仍在,返回 **409** 及与 `/integrity` 一致的 `first_break`(附 `cursor_seq`/`anchor_seq`/租约区间),**游标与租约均不改动**。这是为了防止确认把游标推过缺失序号——游标一旦越过缺口,即使记录事后恢复也不会再投递。记录以原 `seq` 恢复(缺口闭合)后,同一 token 在租约未过期时可直接确认,租约时效与令牌规则不变。
 
 游标只能经由确认前移(整批 `ack`,或前缀 `ack-prefix`),因此**禁止越序确认**:批次内的任何一条都无法被单独跳过或提前确认。需要处理到一半先确认一部分时,见下一节的前缀确认。
 
@@ -255,6 +267,7 @@ curl -X POST http://localhost:8000/consumers/worker-1/ack-prefix \
 - **未知 consumer**,或当前没有租约(从未拉取、已确认完毕、或上次拉取是空批次);
 - token 与当前租约不一致(**伪造**或**旧 token**);
 - 租约**已过期**(过期批次可重投,旧 token 不得再确认);
+- **租约区间存在序号缺口**(与 `ack` 同一套核对,响应 `cannot ack-prefix across a seq gap` 并附 `first_break` 与本次 `through_seq`):即使 `through_seq` 落在缺口之前的已连续前缀上也拒绝推进——否则租约清除、下次重租从 `through_seq+1` 开始,游标仍会越过缺口。记录恢复、缺口闭合后沿用原租约完成前缀确认;
 - `through_seq` **越界**:早于批次起点(响应 `through_seq before batch start`)或晚于批次末尾(`through_seq beyond batch end`),响应中同时给出当前租约的 `lease_from_seq`/`lease_to_seq`。
 
 ```json
@@ -718,7 +731,8 @@ curl -X PUT http://localhost:8000/relations/evt-c/parent \
 - **完整性哈希链**:每条记录引用上一条哈希,写入与链字段更新在同一事务完成(`BEGIN IMMEDIATE` 保证并发下链头一致);`GET /integrity` 全链校验。
 - **时间比较**:`occurred_at` 归一化为 UTC ISO8601 字符串存储,范围查询走字典序比较,并建有索引。
 - **消费游标与租约**:每个 consumer 一行(`consumers` 表),保存已确认游标与当前租约(token、批次起止 seq、过期时间)。`pull` 在 `BEGIN IMMEDIATE` 事务内完成"判租约 → 取批次 → 写租约",与事件写入互斥,并发重复拉取只会得到同一个租约;`ack` 仅推进整批游标并清空租约,token 不符、过期或无租约一律 409。
-- **前缀确认**:`POST /consumers/{consumer_id}/ack-prefix` 与 `ack` 共用同一套租约校验,额外要求 `through_seq` 落在 `[lease_from_seq, lease_to_seq]`;在单个 `BEGIN IMMEDIATE` 事务内把游标推进到 `through_seq` 并清除租约,旧 token 立即作废,下次 `pull` 从 `through_seq+1` 重新租用。`through_seq` 等于批次末尾即整批确认;未知 consumer、过期/伪造/旧 token、序号越界均 409 且状态不变。
+- **序号缺口防护**:首次拉取、未过期租约重拉、过期续租在返回批次前,以及 `ack`/`ack-prefix` 推进游标前,都在同一写事务内核对拟返回/已租用区间从可投递起点(`max(cursor_seq, anchor_seq)`)到批次末尾的序号连续性;断点取值口径与 `/integrity` 的 `seq_gap` 完全一致(缺口后现存的第一条记录)。发现缺口即 409 且状态不变:首次不建租约不发令牌,期内不续租不换令牌,过期不换发新令牌,确认不推进游标——记录以原 seq 恢复后,首次正常建租、期内沿用原 token/过期时间、过期按请求时效换新令牌、确认正常推进,原有请求响应约定不变;归档锚点始终是可投递起点。
+- **前缀确认**:`POST /consumers/{consumer_id}/ack-prefix` 与 `ack` 共用同一套租约与缺口校验,额外要求 `through_seq` 落在 `[lease_from_seq, lease_to_seq]`;在单个 `BEGIN IMMEDIATE` 事务内把游标推进到 `through_seq` 并清除租约,旧 token 立即作废,下次 `pull` 从 `through_seq+1` 重新租用。`through_seq` 等于批次末尾即整批确认;未知 consumer、过期/伪造/旧 token、租约区间有序号缺口(含 through_seq 在缺口之前)、序号越界均 409 且状态不变。
 - **游标回退**:`POST /consumers/{consumer_id}/rewind` 在单个 `BEGIN IMMEDIATE` 事务内完成"校验 consumer/租约/回退区间 `[anchor_seq, cursor_seq]` → 清除已过期租约 → 回退游标",与 `pull`/`ack`/`ack-prefix`/`compact` 串行,并发下只有单一结果。未过期租约、低于链锚点、向前推进、未知 consumer 均 409 且状态不变;回退后游标不低于链锚点,不会产生指向已压缩事件的租约。
 - **毒丸隔离**:`POST /consumers/{consumer_id}/quarantine` 在单个 `BEGIN IMMEDIATE` 事务内完成"核对令牌(与 `ack` 同套:无租约/过期/旧令牌 409)→ 核对租约起点与游标相邻(考虑链锚点)→ 复制首条事件完整内容、原哈希与非空原因到独立 `quarantined_events` 表 → 游标仅越过这一条并清除整批租约"。下次 `pull` 重新租用剩余事件并换发新 token,旧令牌立即作废;失败原因空白返回 422。`GET /consumers/{consumer_id}/quarantine` 分页查看隔离记录;副本独立于原事件存储,原事件被压缩归档(物理删除)后仍可查看。隔离会把游标推进过该事件,因此被隔离事件视为"已处理",可正常纳入安全归档,内容由隔离副本留存。
 - **安全归档压缩**:`POST /retention/compact` 在单个 `BEGIN IMMEDIATE` 事务内完成"读锚点 → 幂等速判已覆盖区间 → 与 `/integrity` 共用 `verify_chain_prefix` 从锚点逐条校验拟删前缀(序号连续性 → 前后哈希衔接 → 内容哈希)→ 算安全边界(所有 consumer 的最小 `cursor_seq`,无 consumer 时为当前最大 seq)→ 校验 `cutoff_seq` → 删连续前缀 → 写链锚点"。拟删前缀出现首个断点时,**实际归档与 `dry_run` 都返回 409**,响应附与 `/integrity` 同形的 `first_break`(seq/event_id/reason,reason 取值 `seq_gap`/`prev_hash_mismatch`/`hash_mismatch`),事件、视图、锚点保持原状——篡改不会因删除并把错误哈希写入锚点而在归档后"洗白"成 `verified=true`;断点不在拟归档前缀内时干净前缀仍可按边界归档,断点在归档后依旧可检;越界 409 并返回 `safe_through_seq`;`dry_run` 只算不写;已覆盖区间幂等返回 `noop`。删除只作用于 `events` 内容与视图计数,**不触碰 `received_event_ids` 占用**,归档后重投同一 ID 仍是 duplicate(单条 200、批量按序 duplicate/seq null),占用信息随写入与归档在同一事务内保持一致。
@@ -737,9 +751,9 @@ curl -X PUT http://localhost:8000/relations/evt-c/parent \
 | GET | `/events` | 时间范围分页查询(`from`/`to`/`page`/`page_size`) |
 | POST | `/replay` | 批量重放,按首次接收顺序输出 |
 | GET | `/integrity` | 从链锚点校验完整性哈希链,返回 `verified`/`checked`/`first_break`/`anchor_seq` |
-| POST | `/consumers/{consumer_id}/pull` | 按首次接收顺序拉取并原子租用未确认事件(`limit`/`lease_seconds`) |
-| POST | `/consumers/{consumer_id}/ack` | 确认当前租约批次并推进游标;过期/伪造/旧 token 返回 409 |
-| POST | `/consumers/{consumer_id}/ack-prefix` | 确认租约内 `[批次起点, through_seq]` 连续前缀并清除租约,下次 `pull` 从 `through_seq+1` 重租;`through_seq` 到批次末尾即整批确认;未知 consumer/过期/旧 token/越界序号返回 409 |
+| POST | `/consumers/{consumer_id}/pull` | 按首次接收顺序拉取并原子租用未确认事件(`limit`/`lease_seconds`);首次拉取/期内重拉/过期续租返回前都核对批次序号连续性,有 `seq_gap` 时 409 回 `first_break`(与 `/integrity` 一致),不建/不改租约、不发新令牌,归档锚点为可投递起点 |
+| POST | `/consumers/{consumer_id}/ack` | 确认当前租约批次并推进游标;过期/伪造/旧 token 返回 409;推进前核对租约区间连续性,缺口仍在时 409 回 `first_break` 且游标/租约不变 |
+| POST | `/consumers/{consumer_id}/ack-prefix` | 确认租约内 `[批次起点, through_seq]` 连续前缀并清除租约,下次 `pull` 从 `through_seq+1` 重租;`through_seq` 到批次末尾即整批确认;未知 consumer/过期/旧 token/租约区间有缺口(含前缀落在缺口前)/越界序号返回 409 |
 | POST | `/consumers/{consumer_id}/rewind` | 游标回退到 `target_seq`(限 `[anchor_seq, cursor_seq]`),下次 `pull` 从 `target_seq+1` 重投;未过期租约/越界/未知 consumer 返回 409 |
 | POST | `/consumers/{consumer_id}/quarantine` | 隔离当前未过期租约的首条事件(带非空 `reason`):单事务核对令牌与租约相邻性、复制完整事件到独立隔离记录、游标越过一条并清除整批租约;无租约/过期/旧令牌/不相邻返回 409,原因为空返回 422 |
 | GET | `/consumers/{consumer_id}/quarantine` | 分页查询该 consumer 的隔离记录;携带原事件完整内容副本,原事件归档后仍可查看 |

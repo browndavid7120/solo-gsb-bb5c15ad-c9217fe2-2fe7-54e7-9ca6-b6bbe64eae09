@@ -111,6 +111,47 @@ def lease_conflict(detail: str) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": detail})
 
 
+def first_seq_gap(
+    conn: sqlite3.Connection, *, base_seq: int, end_seq: int
+) -> Optional[dict[str, Any]]:
+    """核对序号区间 (base_seq, end_seq] 的连续性, 缺口断点口径与 /integrity 的 seq_gap 一致。
+
+    完整性校验里缺口断点指向**缺口之后现存的第一条记录**(附其 seq/event_id);
+    若缺失一直延续到 end_seq(租约批次末尾的记录也缺失、其后在本区间内无现存
+    记录), 断点取缺失的首个序号, event_id 为 None。区间内逐序号均有记录时
+    返回 None。只核对序号连续性、不涉及哈希: 消费流程只负责阻止"把缺口两侧
+    合为一批", 内容/前后哈希篡改仍由 /integrity 与 /retention/compact 检出。
+    """
+    rows = conn.execute(
+        "SELECT id, event_id FROM events WHERE id > ? AND id <= ?",
+        (base_seq, end_seq),
+    ).fetchall()
+    present = {row["id"]: row["event_id"] for row in rows}
+    gap_at: Optional[int] = None
+    for seq in range(base_seq + 1, end_seq + 1):
+        if present.get(seq) is not None:
+            if gap_at is not None:
+                # 缺口后现存的第一条: 与 /integrity 的 seq_gap 断点完全一致
+                return {"seq": seq, "event_id": present[seq], "reason": "seq_gap"}
+        elif gap_at is None:
+            gap_at = seq
+        # 已记录缺口: 继续向后寻找缺口后的第一条现存记录
+    if gap_at is not None:
+        # 缺口之后直到区间末尾都没有现存记录(批次末尾缺失), 无 event_id 可附
+        return {"seq": gap_at, "event_id": None, "reason": "seq_gap"}
+    return None
+
+
+def seq_gap_conflict(
+    detail: str, first_break: dict[str, Any], extra: Optional[dict[str, Any]] = None
+) -> JSONResponse:
+    """序号缺口的统一 409 响应: first_break 与 /integrity 同构, 附调用方上下文。"""
+    content: dict[str, Any] = {"detail": detail, "first_break": first_break}
+    if extra:
+        content.update(extra)
+    return JSONResponse(status_code=409, content=content)
+
+
 def row_to_event(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "seq": row["id"],  # 首次接收顺序号
@@ -631,10 +672,18 @@ def pull(
 ):
     """按首次接收顺序拉取尚未确认的连续事件并原子租用。
 
-    - 首次 consumer 的游标为 0, 即从 seq=1 开始投递。
+    - 首次 consumer 的游标为 0, 即从 seq=1 开始投递; 压缩归档后才建档的
+      consumer 从链锚点之后(可投递起点)开始, 不会投递已归档事件。
     - 存在未过期租约时, 重复拉取原样返回同一批次(不续租、不换 token)。
     - 租约过期后同一批次可被重新投递(换发新 token)。
     - 队列为空(没有游标之后的事件)时返回空批次, 不创建租约。
+
+    三种路径(首次拉取、未过期租约重拉、过期续租)在返回批次前都会核对
+    **拟返回批次从起点到末尾的序号连续性**(缺口口径与 /integrity 的 seq_gap
+    一致)。事件表中间记录意外缺失时, 缺口两侧的事件不会被合为一批: 直接
+    返回 409 及 first_break, 游标与租约保持原状(首次不建租约, 过期不换发
+    新 token)。缺口修复(记录以原 seq 恢复)后: 首次拉取正常建租, 未过期
+    重拉沿用原 token/过期时间, 过期续租仍按原租约时效换发新 token。
     """
     now = utc_now()
     # BEGIN IMMEDIATE 与事件写入互斥, 保证"读批次 -> 建租约"原子完成
@@ -656,7 +705,28 @@ def pull(
             and datetime.fromisoformat(consumer["lease_expires_at"]) > datetime.fromisoformat(now)
         )
         if active:
-            # 租约未过期: 重复拉取必须返回同一批次
+            # 租约未过期: 重复拉取必须返回同一批次。返回前核对租约区间
+            # [from, to] 的序号连续性: 租约建立后其中记录若意外缺失,
+            # 返回 409 与 /integrity 一致的 first_break; 不续租、不换 token,
+            # 游标与租约保持原状。缺口修复后此分支照旧原样返回同一批次。
+            anchor_seq, _ = get_chain_anchor(conn)
+            base_seq = max(consumer["cursor_seq"], anchor_seq)
+            first_break = first_seq_gap(
+                conn,
+                base_seq=base_seq,
+                end_seq=consumer["lease_to_seq"],
+            )
+            if first_break is not None:
+                return seq_gap_conflict(
+                    "leased batch is not seq-continuous",
+                    first_break,
+                    extra={
+                        "cursor_seq": consumer["cursor_seq"],
+                        "anchor_seq": anchor_seq,
+                        "lease_from_seq": consumer["lease_from_seq"],
+                        "lease_to_seq": consumer["lease_to_seq"],
+                    },
+                )
             rows = conn.execute(
                 "SELECT * FROM events WHERE id BETWEEN ? AND ? ORDER BY id",
                 (consumer["lease_from_seq"], consumer["lease_to_seq"]),
@@ -669,7 +739,28 @@ def pull(
             }
 
         if consumer["lease_token"] is not None:
-            # 上一租约已过期: 同一批次可重新投递(沿用原区间, 换发新 token)
+            # 上一租约已过期: 同一批次可重新投递(沿用原区间, 换发新 token)。
+            # 续租前同样核对租约区间连续性: 缺口仍在则 409, 旧 token/旧过期
+            # 时间与游标都不变, 不发放新令牌; 记录恢复后才换发新 token,
+            # 时效沿用本次请求的 lease_seconds。
+            anchor_seq, _ = get_chain_anchor(conn)
+            base_seq = max(consumer["cursor_seq"], anchor_seq)
+            first_break = first_seq_gap(
+                conn,
+                base_seq=base_seq,
+                end_seq=consumer["lease_to_seq"],
+            )
+            if first_break is not None:
+                return seq_gap_conflict(
+                    "leased batch is not seq-continuous",
+                    first_break,
+                    extra={
+                        "cursor_seq": consumer["cursor_seq"],
+                        "anchor_seq": anchor_seq,
+                        "lease_from_seq": consumer["lease_from_seq"],
+                        "lease_to_seq": consumer["lease_to_seq"],
+                    },
+                )
             rows = conn.execute(
                 "SELECT * FROM events WHERE id BETWEEN ? AND ? ORDER BY id",
                 (consumer["lease_from_seq"], consumer["lease_to_seq"]),
@@ -690,10 +781,12 @@ def pull(
                 "lease_expires_at": expires_at,
             }
 
-        # 从未租用: 从游标之后取一段连续事件
+        # 从未租用: 从可投递起点(游标与链锚点的较大者)之后取一段事件
+        anchor_seq, _ = get_chain_anchor(conn)
+        start_seq = max(consumer["cursor_seq"], anchor_seq)
         rows = conn.execute(
             "SELECT * FROM events WHERE id > ? ORDER BY id LIMIT ?",
-            (consumer["cursor_seq"], req.limit),
+            (start_seq, req.limit),
         ).fetchall()
         if not rows:
             # 空队列: 返回空批次且不创建租约
@@ -705,6 +798,22 @@ def pull(
             }
 
         from_seq, to_seq = rows[0]["id"], rows[-1]["id"]
+        # 建租约前核对拟返回批次从起点(可投递起点 +1)到末尾的序号连续性:
+        # LIMIT 会把缺口两侧的现存事件合为一批, 这里阻止它——缺口仍在时
+        # 409 + first_break(与 /integrity 一致), 不建租约、不发放 token,
+        # 游标不变; 记录以原 seq 恢复后, 同请求照常建租并返回完整连续批次。
+        first_break = first_seq_gap(conn, base_seq=start_seq, end_seq=to_seq)
+        if first_break is not None:
+            return seq_gap_conflict(
+                "pull batch is not seq-continuous",
+                first_break,
+                extra={
+                    "cursor_seq": consumer["cursor_seq"],
+                    "anchor_seq": anchor_seq,
+                    "batch_from_seq": from_seq,
+                    "batch_to_seq": to_seq,
+                },
+            )
         token = secrets.token_urlsafe(32)
         expires_at = (
             datetime.fromisoformat(now) + timedelta(seconds=req.lease_seconds)
@@ -730,6 +839,11 @@ def ack(
     """确认当前租约批次: 仅接受未过期且与当前租约一致的 token, 游标推进到批次末尾。
 
     过期、伪造或旧 token 一律 409; 游标只随整批确认前移, 天然禁止越序确认。
+
+    推进前还会核对**当前租约区间的序号连续性**: 租约建立后区间内记录若
+    意外缺失(缺口仍在), 返回 409 及与 /integrity 一致的 first_break, 游标与
+    租约保持原状(绝不越过缺口); 记录以原 seq 恢复后, 同一 token 在租约
+    未过期时可直接确认, 时效与令牌规则不变。
     """
     now = datetime.now(timezone.utc)
     with get_conn() as conn:
@@ -748,6 +862,25 @@ def ack(
         if datetime.fromisoformat(consumer["lease_expires_at"]) <= now:
             # 租约已过期, 该批次可被重新投递, 旧 token 不得再确认
             return lease_conflict("lease expired")
+
+        # 确认前复核租约区间 [lease_from_seq, lease_to_seq]: 缺口仍在则
+        # 拒绝推进, 防止游标越过缺失记录(恢复后缺口闭合, 沿用原租约确认)
+        anchor_seq, _ = get_chain_anchor(conn)
+        base_seq = max(consumer["cursor_seq"], anchor_seq)
+        first_break = first_seq_gap(
+            conn, base_seq=base_seq, end_seq=consumer["lease_to_seq"]
+        )
+        if first_break is not None:
+            return seq_gap_conflict(
+                "cannot ack across a seq gap",
+                first_break,
+                extra={
+                    "cursor_seq": consumer["cursor_seq"],
+                    "anchor_seq": anchor_seq,
+                    "lease_from_seq": consumer["lease_from_seq"],
+                    "lease_to_seq": consumer["lease_to_seq"],
+                },
+            )
 
         to_seq = consumer["lease_to_seq"]
         conn.execute(
@@ -777,6 +910,12 @@ def ack_prefix(
 
     through_seq == lease_to_seq 时等同整批确认。未知 consumer、无租约、
     token 不符(伪造/旧 token)、租约过期或序号越界一律 409 且状态不变。
+
+    越界校验前还会核对**当前租约区间的序号连续性**: 租约建立后区间内记录
+    若意外缺失(缺口仍在), 即使 through_seq 落在缺口之前也返回 409 及与
+    /integrity 一致的 first_break, 游标与租约保持原状; 记录以原 seq 恢复
+    (缺口闭合)后, 同一 token 在租约未过期时可照常做前缀确认, 时效与
+    令牌规则不变。
     """
     now = datetime.now(timezone.utc)
     with get_conn() as conn:
@@ -795,6 +934,28 @@ def ack_prefix(
         if datetime.fromisoformat(consumer["lease_expires_at"]) <= now:
             # 租约已过期, 该批次可被重新投递, 旧 token 不得再确认
             return lease_conflict("lease expired")
+
+        # 推进前复核整个租约区间: 缺口仍在则拒绝任何推进(包括 through_seq
+        # 落在缺口之前的前缀), 防止确认后再 pull 时游标越过缺失记录;
+        # 缺口修复后区间重新连续, 沿用原租约完成前缀确认
+        anchor_seq, _ = get_chain_anchor(conn)
+        base_seq = max(consumer["cursor_seq"], anchor_seq)
+        first_break = first_seq_gap(
+            conn, base_seq=base_seq, end_seq=consumer["lease_to_seq"]
+        )
+        if first_break is not None:
+            return seq_gap_conflict(
+                "cannot ack-prefix across a seq gap",
+                first_break,
+                extra={
+                    "cursor_seq": consumer["cursor_seq"],
+                    "anchor_seq": anchor_seq,
+                    "lease_from_seq": consumer["lease_from_seq"],
+                    "lease_to_seq": consumer["lease_to_seq"],
+                    "through_seq": req.through_seq,
+                },
+            )
+
         if req.through_seq < consumer["lease_from_seq"]:
             return JSONResponse(
                 status_code=409,
